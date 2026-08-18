@@ -1,7 +1,7 @@
 use crate::{
     common::constants::{
-        DEFAULT_RPC_URL, LIGHTHOUSE_PROGRAM_ID, LIGHTHOUSE_PROGRAM_PATH, TRANSFER_HOOK_PROGRAM_ID,
-        TRANSFER_HOOK_PROGRAM_PATH,
+        DEFAULT_RPC_URL, DISABLE_SBPF_V0_V1_V2_DEPLOYMENT_FEATURE, LIGHTHOUSE_PROGRAM_ID,
+        LIGHTHOUSE_PROGRAM_PATH, TRANSFER_HOOK_PROGRAM_ID, TRANSFER_HOOK_PROGRAM_PATH,
     },
     test_runner::accounts::{get_account_address_from_file, AccountFile},
 };
@@ -31,6 +31,9 @@ pub async fn start_test_validator(
 
     let mut cmd = tokio::process::Command::new("solana-test-validator");
     cmd.arg("--reset").arg("--quiet");
+    // On by default on agave >= 4.2 test validators but not on any live cluster;
+    // when active it rejects the prebuilt sbpf-v0 test programs used in loader-v3 tests.
+    cmd.arg("--deactivate-feature").arg(DISABLE_SBPF_V0_V1_V2_DEPLOYMENT_FEATURE);
 
     if Path::new(TRANSFER_HOOK_PROGRAM_PATH).exists() {
         cmd.arg("--bpf-program").arg(TRANSFER_HOOK_PROGRAM_ID).arg(TRANSFER_HOOK_PROGRAM_PATH);

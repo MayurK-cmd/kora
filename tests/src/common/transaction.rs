@@ -10,7 +10,9 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_message::{
-    v0::Message as V0Message, AddressLookupTableAccount, Message, VersionedMessage,
+    v0::Message as V0Message,
+    v1::{Message as V1Message, TransactionConfig},
+    AddressLookupTableAccount, Message, VersionedMessage,
 };
 use solana_program_pack::Pack;
 use solana_sdk::{
@@ -35,6 +37,7 @@ pub enum TransactionVersion {
     Legacy,
     V0,
     V0WithLookup(Vec<Pubkey>),
+    V1,
 }
 
 /// Fluent transaction builder for tests
@@ -44,6 +47,7 @@ pub struct TransactionBuilder {
     fee_payer: Option<Pubkey>,
     signers: Vec<Keypair>,
     rpc_client: Option<Arc<RpcClient>>,
+    v1_priority_fee: Option<u64>,
 }
 
 impl TransactionBuilder {
@@ -55,6 +59,7 @@ impl TransactionBuilder {
             fee_payer: None,
             signers: Vec::new(),
             rpc_client: None,
+            v1_priority_fee: None,
         }
     }
 
@@ -66,6 +71,7 @@ impl TransactionBuilder {
             fee_payer: None,
             signers: Vec::new(),
             rpc_client: None,
+            v1_priority_fee: None,
         }
     }
 
@@ -77,6 +83,19 @@ impl TransactionBuilder {
             fee_payer: None,
             signers: Vec::new(),
             rpc_client: None,
+            v1_priority_fee: None,
+        }
+    }
+
+    /// Create a V1 transaction builder
+    pub fn v1() -> Self {
+        Self {
+            version: TransactionVersion::V1,
+            instructions: Vec::new(),
+            fee_payer: None,
+            signers: Vec::new(),
+            rpc_client: None,
+            v1_priority_fee: None,
         }
     }
 
@@ -252,6 +271,12 @@ impl TransactionBuilder {
         .expect("Failed to create SPL transfer_checked instruction");
 
         self.instructions.push(instruction);
+        self
+    }
+
+    /// Set the priority fee (flat lamports) in the V1 transaction config
+    pub fn with_v1_priority_fee(mut self, lamports: u64) -> Self {
+        self.v1_priority_fee = Some(lamports);
         self
     }
 
@@ -678,6 +703,23 @@ impl TransactionBuilder {
                     )?;
                     VersionedMessage::V0(v0_message)
                 }
+                TransactionVersion::V1 => {
+                    // An empty config mask requests 0 compute units and a 0 (32KiB)
+                    // loaded-accounts-data cap, so real limits must be set explicitly.
+                    let mut config = TransactionConfig::empty()
+                        .with_compute_unit_limit(1_400_000)
+                        .with_loaded_accounts_data_size_limit(64 * 1024 * 1024);
+                    if let Some(priority_fee) = self.v1_priority_fee {
+                        config = config.with_priority_fee(priority_fee);
+                    }
+                    let v1_message = V1Message::try_compile_with_config(
+                        &fee_payer,
+                        &self.instructions,
+                        blockhash.0,
+                        config,
+                    )?;
+                    VersionedMessage::V1(v1_message)
+                }
             };
 
         let transaction = if self.signers.is_empty() {
@@ -703,8 +745,7 @@ impl TransactionBuilder {
             tx
         };
 
-        let serialized = bincode::serialize(&transaction)?;
-        Ok(STANDARD.encode(serialized))
+        Ok(TransactionUtil::encode_versioned_transaction(&transaction)?)
     }
 
     /// Build a durable transaction using a nonce account's stored blockhash.

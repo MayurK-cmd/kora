@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
@@ -37,7 +36,7 @@ use crate::{
         ParsedBpfLoaderUpgradeableInstructionData, ParsedBpfLoaderUpgradeableInstructionType,
         ParsedLoaderV4InstructionData, ParsedLoaderV4InstructionType, ParsedSPLInstructionData,
         ParsedSPLInstructionType, ParsedSystemInstructionData, ParsedSystemInstructionType,
-        Token2022SecurityInstruction, Token2022SecurityParser,
+        Token2022SecurityInstruction, Token2022SecurityParser, TransactionUtil,
     },
     validator::transaction_validator::TransactionValidator,
     CacheUtil,
@@ -168,6 +167,10 @@ impl VersionedTransactionResolved {
                     alt_cache,
                 )
                 .await?
+            }
+            VersionedMessage::V1(_) => {
+                // V1 transactions don't support lookup tables
+                vec![]
             }
         };
 
@@ -362,13 +365,7 @@ impl VersionedTransactionResolved {
 #[async_trait]
 impl VersionedTransactionOps for VersionedTransactionResolved {
     fn encode_b64_transaction(&self) -> Result<String, KoraError> {
-        let serialized = bincode::serialize(&self.transaction).map_err(|e| {
-            KoraError::SerializationError(format!(
-                "Base64 serialization failed: {}",
-                sanitize_error!(e)
-            ))
-        })?;
-        Ok(STANDARD.encode(serialized))
+        TransactionUtil::encode_versioned_transaction(&self.transaction)
     }
 
     fn signer_pubkeys(&self) -> &[Pubkey] {
@@ -544,8 +541,7 @@ impl VersionedTransactionOps for VersionedTransactionResolved {
         *signature_slot = signature;
 
         // Serialize signed transaction
-        let serialized = bincode::serialize(&transaction)?;
-        let encoded = STANDARD.encode(serialized);
+        let encoded = TransactionUtil::encode_versioned_transaction(&transaction)?;
 
         Ok((transaction, encoded))
     }
@@ -740,13 +736,14 @@ mod tests {
         transaction::TransactionUtil,
         Config,
     };
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use solana_client::rpc_request::RpcRequest;
     use std::collections::HashMap;
 
     use super::*;
     use solana_address_lookup_table_interface::state::LookupTableMeta;
-    use solana_message::{compiled_instruction::CompiledInstruction, v0, Message};
+    use solana_message::{compiled_instruction::CompiledInstruction, v0, v1, Message};
     use solana_sdk::{
         account::Account,
         hash::Hash,
@@ -1066,6 +1063,41 @@ mod tests {
         assert_eq!(resolved.all_instructions[0].data, vec![1, 2, 3]);
     }
 
+    #[test]
+    fn test_from_kora_built_transaction_v1() {
+        let keypair = Keypair::new();
+        let program_id = Pubkey::new_unique();
+        let other_account = Pubkey::new_unique();
+
+        let v1_message = v1::Message {
+            header: solana_message::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            config: v1::TransactionConfig::empty(),
+            lifetime_specifier: Hash::new_unique(),
+            account_keys: vec![keypair.pubkey(), other_account, program_id],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts: vec![0, 1],
+                data: vec![1, 2, 3],
+            }],
+        };
+        let message = VersionedMessage::V1(v1_message);
+        let transaction = VersionedTransaction::try_new(message.clone(), &[&keypair]).unwrap();
+
+        let resolved =
+            VersionedTransactionResolved::from_kora_built_transaction(&transaction).unwrap();
+
+        assert_eq!(resolved.transaction, transaction);
+        assert_eq!(resolved.all_account_keys, vec![keypair.pubkey(), other_account, program_id]);
+        assert_eq!(resolved.all_instructions.len(), 1);
+        assert_eq!(resolved.all_instructions[0].program_id, program_id);
+        assert_eq!(resolved.all_instructions[0].accounts.len(), 2);
+        assert_eq!(resolved.all_instructions[0].data, vec![1, 2, 3]);
+    }
+
     #[tokio::test]
     async fn test_from_transaction_legacy() {
         let config = setup_test_config();
@@ -1175,7 +1207,7 @@ mod tests {
         // Create mock RPC client with lookup table account and simulation
         let mut mocks = HashMap::new();
         let serialized_data = lookup_table.serialize_for_tests().unwrap();
-        let encoded_data = base64::engine::general_purpose::STANDARD.encode(&serialized_data);
+        let encoded_data = STANDARD.encode(&serialized_data);
 
         mocks.insert(
             RpcRequest::GetMultipleAccounts,

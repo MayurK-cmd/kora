@@ -1,6 +1,7 @@
 use crate::common::*;
 use jsonrpsee::rpc_params;
 use kora_lib::transaction::TransactionUtil;
+use solana_message::VersionedMessage;
 use solana_sdk::signature::Signer;
 use std::str::FromStr;
 
@@ -107,9 +108,135 @@ async fn test_sign_transaction_invalid_transaction() {
     assert!(result.is_err(), "Expected error for invalid transaction");
 }
 
+/// Sign a v1 transaction through Kora
+#[tokio::test]
+async fn test_sign_transaction_v1() {
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+
+    let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
+    let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
+    let sender = SenderTestHelper::get_test_sender_keypair();
+
+    let v1_transaction = ctx
+        .v1_transaction_builder()
+        .with_fee_payer(fee_payer)
+        .with_spl_transfer(
+            &token_mint,
+            &sender.pubkey(),
+            &fee_payer,
+            tests::common::helpers::get_fee_for_default_transaction_in_usdc(),
+        )
+        .with_transfer(&sender.pubkey(), &RecipientTestHelper::get_recipient_pubkey(), 10)
+        .build()
+        .await
+        .expect("Failed to create V1 transaction");
+
+    let response: serde_json::Value = ctx
+        .rpc_call("signTransaction", rpc_params![v1_transaction])
+        .await
+        .expect("Failed to sign V1 transaction");
+
+    response.assert_success();
+
+    let transaction_string =
+        response["signed_transaction"].as_str().expect("Expected signed_transaction in response");
+    let transaction = TransactionUtil::decode_b64_transaction(transaction_string)
+        .expect("Failed to decode transaction from base64");
+
+    assert!(
+        matches!(transaction.message, VersionedMessage::V1(_)),
+        "Expected signed transaction to still be V1"
+    );
+
+    let fee_payer_index = transaction
+        .message
+        .static_account_keys()
+        .iter()
+        .position(|key| key == &fee_payer)
+        .expect("Fee payer not found in account keys");
+    assert!(
+        transaction.signatures[fee_payer_index]
+            .verify(fee_payer.as_ref(), &transaction.message.serialize()),
+        "Kora's signature must verify over the v1 wire message bytes"
+    );
+}
+
+/// A V1 config priority fee is paid by the fee payer, so max_allowed_lamports
+/// must reject it just like a ComputeBudget priority fee. The payment overpays
+/// on purpose so the lamport-fee guard is the check that fires, not payment
+/// validation.
+#[tokio::test]
+async fn test_sign_transaction_v1_rejects_priority_fee_above_max_allowed_lamports() {
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+
+    let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
+    let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
+    let sender = SenderTestHelper::get_test_sender_keypair();
+
+    // max_allowed_lamports is 1_000_000 in kora-test.toml
+    let v1_transaction = ctx
+        .v1_transaction_builder()
+        .with_fee_payer(fee_payer)
+        .with_v1_priority_fee(2_000_000)
+        .with_spl_transfer(&token_mint, &sender.pubkey(), &fee_payer, 3_000_000)
+        .with_transfer(&sender.pubkey(), &RecipientTestHelper::get_recipient_pubkey(), 10)
+        .build()
+        .await
+        .expect("Failed to create V1 transaction");
+
+    let result: Result<serde_json::Value, _> =
+        ctx.rpc_call("signTransaction", rpc_params![v1_transaction]).await;
+
+    let error =
+        result.expect_err("Expected rejection for V1 priority fee above max_allowed_lamports");
+    assert!(
+        error.to_string().contains("exceeds maximum allowed"),
+        "Expected max_allowed_lamports rejection, got: {error}"
+    );
+}
+
 // **************************************************************************************
 // Sign and send transaction tests
 // **************************************************************************************
+
+/// Sign and send a v1 transaction; the default respond_after is Confirmed, so a
+/// success response means the v1 transaction landed on-chain.
+#[tokio::test]
+async fn test_sign_and_send_transaction_v1() {
+    let sender = SenderTestHelper::get_test_sender_keypair();
+    let recipient = RecipientTestHelper::get_recipient_pubkey();
+    let fee_payer = FeePayerTestHelper::get_fee_payer_pubkey();
+    let token_mint = USDCMintTestHelper::get_test_usdc_mint_pubkey();
+
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+
+    let test_tx = ctx
+        .v1_transaction_builder()
+        .with_fee_payer(fee_payer)
+        .with_signer(&sender)
+        .with_spl_transfer(
+            &token_mint,
+            &sender.pubkey(),
+            &fee_payer,
+            tests::common::helpers::get_fee_for_default_transaction_in_usdc(),
+        )
+        .with_transfer(&sender.pubkey(), &recipient, 10)
+        .build()
+        .await
+        .expect("Failed to create signed V1 transaction");
+
+    let result: Result<serde_json::Value, _> =
+        ctx.rpc_call("signAndSendTransaction", rpc_params![test_tx]).await;
+
+    assert!(result.is_ok(), "Expected signAndSendTransaction to succeed for V1: {result:?}");
+    let response = result.unwrap();
+
+    assert!(
+        response["signed_transaction"].as_str().is_some(),
+        "Expected signed_transaction in response"
+    );
+    assert!(response["signature"].as_str().is_some(), "Expected signature in response");
+}
 
 #[tokio::test]
 async fn test_sign_and_send_transaction_legacy() {
