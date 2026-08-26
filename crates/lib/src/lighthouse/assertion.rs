@@ -274,16 +274,23 @@ impl LighthouseUtil {
             })?
             .len();
 
-        let max_size = TransactionUtil::max_transaction_size(&tx_with_assertion.message);
-        if new_size > max_size {
+        // Appending the assertion adds accounts and an instruction, either of which can push
+        // the message past a limit that is not about byte size
+        let rejection = if let Err(e) = tx_with_assertion.message.sanitize() {
+            Some(format!("would produce an invalid message ({e})"))
+        } else {
+            let max_size = TransactionUtil::max_transaction_size(&tx_with_assertion.message);
+            (new_size > max_size)
+                .then(|| format!("would exceed transaction size limit ({new_size} > {max_size})"))
+        };
+
+        if let Some(reason) = rejection {
             if config.fail_if_transaction_size_overflow {
                 return Err(KoraError::ValidationError(format!(
-                    "Adding Lighthouse assertion would exceed transaction size limit ({new_size} > {max_size})"
+                    "Adding Lighthouse assertion {reason}"
                 )));
             } else {
-                log::warn!(
-                    "Lighthouse assertion would exceed transaction size limit ({new_size} > {max_size}). Skipping."
-                );
+                log::warn!("Lighthouse assertion {reason}. Skipping.");
                 return Ok(());
             }
         }
@@ -297,6 +304,7 @@ impl LighthouseUtil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::transaction_mock::create_mock_v1_transaction_with_max_addresses;
     use solana_message::{v0, v1, Message, VersionedMessage};
     use solana_sdk::{hash::Hash, instruction::AccountMeta, signature::Keypair, signer::Signer};
 
@@ -481,6 +489,41 @@ mod tests {
             LighthouseUtil::append_lighthouse_assertion(&mut transaction, assertion_ix, &config);
         assert!(result.is_ok());
         assert!(transaction.message.static_account_keys().contains(&LIGHTHOUSE_PROGRAM_ID));
+    }
+
+    #[test]
+    fn test_append_lighthouse_assertion_v1_rejects_exceeding_address_limit() {
+        let keypair = Keypair::new_from_array([1; 32]);
+        let mut transaction = create_mock_v1_transaction_with_max_addresses(&keypair);
+
+        let assertion_ix = LighthouseUtil::build_fee_payer_assertion(&keypair.pubkey(), 1_000_000);
+        let config = LighthouseConfig { enabled: true, fail_if_transaction_size_overflow: true };
+
+        let result =
+            LighthouseUtil::append_lighthouse_assertion(&mut transaction, assertion_ix, &config);
+
+        let error = result.expect_err("assertion must not push the message past 64 addresses");
+        assert!(
+            error.to_string().contains("would produce an invalid message"),
+            "unexpected error: {error}"
+        );
+        assert!(!transaction.message.static_account_keys().contains(&LIGHTHOUSE_PROGRAM_ID));
+    }
+
+    #[test]
+    fn test_append_lighthouse_assertion_v1_skips_exceeding_address_limit_when_configured() {
+        let keypair = Keypair::new_from_array([2; 32]);
+        let mut transaction = create_mock_v1_transaction_with_max_addresses(&keypair);
+        let original_ix_count = transaction.message.instructions().len();
+
+        let assertion_ix = LighthouseUtil::build_fee_payer_assertion(&keypair.pubkey(), 1_000_000);
+        let config = LighthouseConfig { enabled: true, fail_if_transaction_size_overflow: false };
+
+        LighthouseUtil::append_lighthouse_assertion(&mut transaction, assertion_ix, &config)
+            .expect("assertion is skipped, not an error");
+
+        assert_eq!(transaction.message.instructions().len(), original_ix_count);
+        assert!(!transaction.message.static_account_keys().contains(&LIGHTHOUSE_PROGRAM_ID));
     }
 
     #[test]
