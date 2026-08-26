@@ -29,6 +29,10 @@ use crate::cache::CacheUtil;
 #[cfg(test)]
 use crate::tests::cache_mock::MockCacheUtil as CacheUtil;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_client::SerializableMessage};
+use solana_compute_budget::compute_budget_limits::{
+    ComputeBudgetLimits, DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_LIMIT,
+};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_message::VersionedMessage;
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
@@ -800,6 +804,61 @@ impl TransactionFeeUtil {
         }
         .map_err(|e| KoraError::RpcError(e.to_string()))
     }
+
+    /// Priority fee in lamports the transaction requests: the config field for V1,
+    /// ComputeBudget price times limit for legacy/V0.
+    ///
+    /// When no SetComputeUnitLimit is present the runtime derives a default limit per
+    /// instruction, charging a builtin less than a program. Deriving it here would take the
+    /// cluster's feature set, so every instruction is billed at the higher per-instruction
+    /// default instead: an upper bound on the runtime's own default, so the cap can only
+    /// over-reject, never under.
+    ///
+    /// `account_keys` must be the resolved key list: the runtime resolves program
+    /// ids against lookup-table loaded keys too.
+    pub fn get_requested_priority_fee(message: &VersionedMessage, account_keys: &[Pubkey]) -> u64 {
+        if let VersionedMessage::V1(v1_message) = message {
+            return v1_message.config.priority_fee.unwrap_or(0);
+        }
+
+        let compute_budget_program_id = solana_compute_budget_interface::id();
+        let mut compute_unit_price: Option<u64> = None;
+        let mut compute_unit_limit: Option<u32> = None;
+        let mut non_compute_budget_instructions: u32 = 0;
+        for instruction in message.instructions() {
+            if account_keys.get(instruction.program_id_index as usize)
+                != Some(&compute_budget_program_id)
+            {
+                non_compute_budget_instructions = non_compute_budget_instructions.saturating_add(1);
+                continue;
+            }
+            match borsh::from_slice(&instruction.data) {
+                Ok(ComputeBudgetInstruction::SetComputeUnitPrice(micro_lamports)) => {
+                    compute_unit_price.get_or_insert(micro_lamports);
+                }
+                Ok(ComputeBudgetInstruction::SetComputeUnitLimit(units)) => {
+                    compute_unit_limit.get_or_insert(units);
+                }
+                _ => {}
+            }
+        }
+
+        let Some(price) = compute_unit_price.filter(|price| *price > 0) else {
+            return 0;
+        };
+
+        let default_compute_unit_limit =
+            non_compute_budget_instructions.saturating_mul(DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT);
+
+        ComputeBudgetLimits {
+            compute_unit_price: price,
+            compute_unit_limit: compute_unit_limit
+                .unwrap_or(default_compute_unit_limit)
+                .min(MAX_COMPUTE_UNIT_LIMIT),
+            ..Default::default()
+        }
+        .get_prioritization_fee()
+    }
 }
 
 #[cfg(test)]
@@ -820,6 +879,9 @@ mod tests {
             },
             config_mock::{mock_state::get_config, ConfigMockBuilder},
             rpc_mock::RpcMockBuilder,
+            transaction_mock::{
+                create_legacy_message, create_v0_message_with_alt_loaded_program, create_v1_message,
+            },
         },
         token::{
             interface::TokenInterface, spl_token::TokenProgram, spl_token_2022::Token2022Program,
@@ -2447,5 +2509,173 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, 9000, "Should return mocked base fee for V1 message");
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_legacy_price_and_limit() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(25_000),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            7_500
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_rounds_up() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(100),
+                ComputeBudgetInstruction::set_compute_unit_price(1),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            1
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_price_without_limit_bills_per_instruction_default() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(2_000),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+
+        // The lone transfer defaults to 200_000 CU, so 2_000 micro-lamports over it = 400 lamports.
+        // Billing the 1.4M protocol maximum instead would overstate this sevenfold.
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            400
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_default_limit_clamps_to_protocol_maximum() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_price(2_000)];
+        instructions.extend((0..8).map(|_| transfer(&payer, &recipient, 1_000)));
+        let message = create_legacy_message(&payer, &instructions);
+
+        // 8 instructions x 200_000 = 1.6M CU, over the 1.4M the runtime will grant,
+        // so the fee is 2_000 micro-lamports over 1.4M = 2_800 lamports.
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            2_800
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_zero_without_price() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let no_compute_budget =
+            create_legacy_message(&payer, &[transfer(&payer, &recipient, 1_000)]);
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(
+                &no_compute_budget,
+                no_compute_budget.static_account_keys()
+            ),
+            0
+        );
+
+        let zero_price = create_legacy_message(
+            &payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(0),
+                transfer(&payer, &recipient, 1_000),
+            ],
+        );
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(
+                &zero_price,
+                zero_price.static_account_keys()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v1_reads_config() {
+        let message = create_v1_message(
+            &Pubkey::new_unique(),
+            v1::TransactionConfig::empty().with_priority_fee(1_234).with_compute_unit_limit(200),
+        );
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            1_234
+        );
+
+        let no_fee = create_v1_message(&Pubkey::new_unique(), v1::TransactionConfig::empty());
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&no_fee, no_fee.static_account_keys()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v1_ignores_compute_budget_instructions() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let message = v1::Message::try_compile(
+            &payer.pubkey(),
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(50_000),
+                transfer(&payer.pubkey(), &recipient, 1_000),
+            ],
+            Hash::default(),
+        )
+        .expect("Failed to compile V1 message");
+
+        // The runtime treats ComputeBudget instructions in V1 transactions as
+        // no-ops; only the config field carries the priority fee.
+        let message = VersionedMessage::V1(message);
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, message.static_account_keys()),
+            0
+        );
+    }
+
+    #[test]
+    fn test_get_requested_priority_fee_v0_with_alt_loaded_compute_budget() {
+        let payer = Pubkey::new_unique();
+        let limit_data = ComputeBudgetInstruction::set_compute_unit_limit(300_000).data;
+        let price_data = ComputeBudgetInstruction::set_compute_unit_price(2_000).data;
+
+        // The ComputeBudget program id lives past the static keys (loaded from a
+        // lookup table); the runtime still processes these instructions, so the
+        // extraction must resolve program ids against the full resolved key list.
+        let message =
+            create_v0_message_with_alt_loaded_program(&payer, vec![limit_data, price_data]);
+        let resolved_keys = vec![payer, solana_compute_budget_interface::id()];
+
+        assert_eq!(
+            TransactionFeeUtil::get_requested_priority_fee(&message, &resolved_keys),
+            600,
+            "300_000 CU * 2_000 micro-lamports = 600 lamports must be counted \
+             even when the ComputeBudget program is loaded via a lookup table"
+        );
     }
 }

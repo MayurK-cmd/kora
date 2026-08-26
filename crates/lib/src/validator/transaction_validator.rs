@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, FeePayerPolicy, ProgramsConfig},
     error::KoraError,
-    fee::fee::{FeeConfigUtil, TotalFeeCalculation},
+    fee::fee::{FeeConfigUtil, TotalFeeCalculation, TransactionFeeUtil},
     oracle::PriceSource,
     token::{
         interface::TokenMint,
@@ -25,6 +25,7 @@ use crate::fee::price::PriceModel;
 pub struct TransactionValidator {
     fee_payer_pubkey: Pubkey,
     max_allowed_lamports: u64,
+    max_priority_fee_lamports: Option<u64>,
     allowed_programs: HashSet<Pubkey>,
     allow_all_programs: bool,
     require_one_of_programs: HashSet<Pubkey>,
@@ -72,6 +73,7 @@ impl TransactionValidator {
         Ok(Self {
             fee_payer_pubkey,
             max_allowed_lamports: config.max_allowed_lamports,
+            max_priority_fee_lamports: config.max_priority_fee_lamports,
             allowed_programs,
             allow_all_programs,
             require_one_of_programs,
@@ -146,6 +148,7 @@ impl TransactionValidator {
 
         self.validate_programs(transaction_resolved)?;
         self.validate_require_one_of_programs(transaction_resolved)?;
+        self.validate_priority_fee(transaction_resolved)?;
         self.validate_transfer_amounts(config, transaction_resolved, rpc_client).await?;
         self.validate_disallowed_accounts(transaction_resolved)?;
         self.validate_fee_payer_usage(config, transaction_resolved)?;
@@ -224,6 +227,27 @@ impl TransactionValidator {
                  its resource limits come from the transaction config"
             );
         }
+    }
+
+    fn validate_priority_fee(
+        &self,
+        transaction_resolved: &VersionedTransactionResolved,
+    ) -> Result<(), KoraError> {
+        let Some(max_priority_fee_lamports) = self.max_priority_fee_lamports else {
+            return Ok(());
+        };
+
+        let priority_fee = TransactionFeeUtil::get_requested_priority_fee(
+            &transaction_resolved.transaction.message,
+            &transaction_resolved.all_account_keys,
+        );
+        if priority_fee > max_priority_fee_lamports {
+            return Err(KoraError::InvalidTransaction(format!(
+                "Priority fee {priority_fee} exceeds maximum allowed {max_priority_fee_lamports}"
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn validate_lamport_fee(&self, fee: u64) -> Result<(), KoraError> {
@@ -1032,6 +1056,11 @@ mod tests {
             account_mock::{AccountMockBuilder, MintAccountMockBuilder, TokenAccountMockBuilder},
             config_mock::{mock_state::setup_config_mock, ConfigMockBuilder},
             rpc_mock::RpcMockBuilder,
+            transaction_mock::{
+                create_legacy_message, create_resolved_with_loaded_keys,
+                create_v0_message_with_alt_loaded_program, create_v1_message,
+                create_v1_message_with_instructions,
+            },
         },
         transaction::TransactionUtil,
     };
@@ -1044,7 +1073,7 @@ mod tests {
         instruction as alt_instruction, program::ID as ADDRESS_LOOKUP_TABLE_PROGRAM_ID,
     };
     use solana_compute_budget_interface::ComputeBudgetInstruction;
-    use solana_message::{Message, VersionedMessage};
+    use solana_message::{v1, Message, VersionedMessage};
     use solana_sdk::{
         instruction::{AccountMeta, Instruction},
         signature::{Keypair, Signer},
@@ -1414,6 +1443,185 @@ mod tests {
             .validate_transaction(get_config().unwrap(), &mut transaction, &rpc_client)
             .await
             .is_ok());
+    }
+
+    fn resolved_from_message(message: VersionedMessage) -> VersionedTransactionResolved {
+        TransactionUtil::new_unsigned_versioned_transaction_resolved(message).unwrap()
+    }
+
+    #[test]
+    fn test_validate_priority_fee_unset_allows_any() {
+        let fee_payer = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        let transaction = resolved_from_message(create_v1_message(
+            &fee_payer,
+            v1::TransactionConfig::empty().with_priority_fee(u64::MAX),
+        ));
+
+        assert!(validator.validate_priority_fee(&transaction).is_ok());
+    }
+
+    #[test]
+    fn test_validate_priority_fee_enforces_cap_for_v1_config() {
+        let fee_payer = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(10_000).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        let under_cap = resolved_from_message(create_v1_message(
+            &fee_payer,
+            v1::TransactionConfig::empty().with_priority_fee(10_000),
+        ));
+        assert!(validator.validate_priority_fee(&under_cap).is_ok());
+
+        let over_cap = resolved_from_message(create_v1_message(
+            &fee_payer,
+            v1::TransactionConfig::empty().with_priority_fee(10_001),
+        ));
+        let error = validator.validate_priority_fee(&over_cap).unwrap_err();
+        assert!(
+            error.to_string().contains("Priority fee 10001 exceeds maximum allowed 10000"),
+            "Unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_priority_fee_enforces_cap_for_compute_budget_instructions() {
+        let fee_payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(10_000).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        // 300_000 CU * 25_000 micro-lamports = 7_500 lamports, under the cap
+        let under_cap = resolved_from_message(create_legacy_message(
+            &fee_payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(25_000),
+                transfer(&fee_payer, &recipient, 1_000),
+            ],
+        ));
+        assert!(validator.validate_priority_fee(&under_cap).is_ok());
+
+        // 300_000 CU * 50_000 micro-lamports = 15_000 lamports, over the cap
+        let over_cap = resolved_from_message(create_legacy_message(
+            &fee_payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(50_000),
+                transfer(&fee_payer, &recipient, 1_000),
+            ],
+        ));
+        let error = validator.validate_priority_fee(&over_cap).unwrap_err();
+        assert!(
+            error.to_string().contains("Priority fee 15000 exceeds maximum allowed 10000"),
+            "Unexpected error: {error}"
+        );
+    }
+
+    /// The runtime ignores ComputeBudget instructions in a V1 transaction, so the cap must
+    /// read the transaction config alone. Billing the instructions instead would reject a
+    /// transaction whose real priority fee is under the cap.
+    #[test]
+    fn test_validate_priority_fee_v1_ignores_over_cap_compute_budget_instructions() {
+        let fee_payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(10_000).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        // Config asks 9_000, under the cap; the inert instructions ask
+        // 300_000 CU * 100_000 micro-lamports = 30_000 lamports, well over it.
+        let transaction = resolved_from_message(create_v1_message_with_instructions(
+            &fee_payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(100_000),
+                transfer(&fee_payer, &recipient, 1_000),
+            ],
+            v1::TransactionConfig::empty().with_priority_fee(9_000),
+        ));
+
+        assert!(validator.validate_priority_fee(&transaction).is_ok());
+    }
+
+    /// The mirror case: under-cap ComputeBudget instructions must not rescue a V1
+    /// transaction whose config priority fee is over the cap.
+    #[test]
+    fn test_validate_priority_fee_v1_rejects_over_cap_config_despite_cheap_instructions() {
+        let fee_payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(10_000).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        // Config asks 11_000, over the cap; the inert instructions ask
+        // 300_000 CU * 10_000 micro-lamports = 3_000 lamports, under it.
+        let transaction = resolved_from_message(create_v1_message_with_instructions(
+            &fee_payer,
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+                ComputeBudgetInstruction::set_compute_unit_price(10_000),
+                transfer(&fee_payer, &recipient, 1_000),
+            ],
+            v1::TransactionConfig::empty().with_priority_fee(11_000),
+        ));
+
+        let error = validator.validate_priority_fee(&transaction).unwrap_err();
+        assert!(
+            error.to_string().contains("Priority fee 11000 exceeds maximum allowed 10000"),
+            "Unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_priority_fee_zero_cap_blocks_priority_fees() {
+        let fee_payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(0).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        let no_priority_fee = resolved_from_message(create_legacy_message(
+            &fee_payer,
+            &[transfer(&fee_payer, &recipient, 1_000)],
+        ));
+        assert!(validator.validate_priority_fee(&no_priority_fee).is_ok());
+
+        let v1_no_priority_fee =
+            resolved_from_message(create_v1_message(&fee_payer, v1::TransactionConfig::empty()));
+        assert!(validator.validate_priority_fee(&v1_no_priority_fee).is_ok());
+
+        let v1_with_priority_fee = resolved_from_message(create_v1_message(
+            &fee_payer,
+            v1::TransactionConfig::empty().with_priority_fee(1),
+        ));
+        assert!(validator.validate_priority_fee(&v1_with_priority_fee).is_err());
+    }
+
+    #[test]
+    fn test_validate_priority_fee_counts_alt_loaded_compute_budget() {
+        let fee_payer = Pubkey::new_unique();
+        let config = ConfigMockBuilder::new().with_max_priority_fee_lamports(10_000).build();
+        let validator = TransactionValidator::new(&config, fee_payer).unwrap();
+
+        let message = create_v0_message_with_alt_loaded_program(
+            &fee_payer,
+            vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(300_000).data,
+                ComputeBudgetInstruction::set_compute_unit_price(50_000).data,
+            ],
+        );
+        let resolved = create_resolved_with_loaded_keys(
+            message,
+            vec![fee_payer, solana_compute_budget_interface::id()],
+        );
+
+        // 300_000 CU * 50_000 micro-lamports = 15_000 lamports, over the cap;
+        // the validator must see it through the resolved keys, not the static ones.
+        let error = validator.validate_priority_fee(&resolved).unwrap_err();
+        assert!(
+            error.to_string().contains("Priority fee 15000 exceeds maximum allowed 10000"),
+            "Unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
