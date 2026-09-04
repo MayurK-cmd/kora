@@ -7,7 +7,7 @@ use kora_lib::{
     admin::token_util::initialize_atas,
     error::KoraError,
     log::LoggingFormat,
-    rpc::get_rpc_client,
+    rpc::get_failover_rpc_client,
     rpc_server::{run_rpc_server, KoraRpc, RpcArgs},
     signer::init::init_signers,
     state::init_config,
@@ -120,7 +120,15 @@ async fn main() -> Result<(), KoraError> {
         std::process::exit(1);
     });
 
-    let rpc_client = get_rpc_client(&cli.global_args.rpc_url);
+    let endpoints = cli.global_args.get_rpc_endpoints().unwrap_or_else(|e| {
+        print_error(&e);
+        std::process::exit(1);
+    });
+
+    let rpc_client = get_failover_rpc_client(endpoints).unwrap_or_else(|e| {
+        print_error(&e);
+        std::process::exit(1);
+    });
 
     match cli.command {
         Some(Commands::Config { config_command }) => {
@@ -185,7 +193,10 @@ async fn main() -> Result<(), KoraError> {
                     std::process::exit(1);
                 }
 
-                let rpc_client = get_rpc_client(&cli.global_args.rpc_url);
+                let rpc_client = get_failover_rpc_client(endpoints).unwrap_or_else(|e| {
+                    print_error(&e);
+                    std::process::exit(1);
+                });
 
                 let kora_rpc = KoraRpc::new(rpc_client);
 
