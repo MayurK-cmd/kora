@@ -46,9 +46,8 @@ impl FailoverRpcCallWrapper {
                     // Check if this is a 5xx or transport error
                     if Self::is_retryable_error(&e) {
                         log::warn!(
-                            "RPC endpoint {} returned retryable error ({}). Attempting endpoint {}",
+                            "RPC endpoint {} returned retryable error. Attempting endpoint {}",
                             attempt,
-                            e,
                             (attempt + 1) % endpoint_count
                         );
                         self.failover_client.rotate_on_failure();
@@ -63,10 +62,7 @@ impl FailoverRpcCallWrapper {
         }
 
         // All endpoints exhausted
-        log::error!(
-            "All RPC endpoints exhausted. Last error: {}",
-            last_error.as_ref().map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
-        );
+        log::error!("All RPC endpoints exhausted");
         Err(last_error.unwrap())
     }
 

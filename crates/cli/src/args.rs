@@ -11,8 +11,8 @@ pub struct GlobalArgs {
     pub rpc_urls: Option<String>,
 
     /// Solana RPC endpoint URL (deprecated: use --rpc-urls instead)
-    #[arg(long, env = "RPC_URL")]
-    pub rpc_url: Option<String>,
+    #[arg(long, env = "RPC_URL", default_value = "http://127.0.0.1:8899")]
+    pub rpc_url: String,
 
     /// Path to Kora configuration file (TOML format)
     #[arg(long, default_value = "kora.toml")]
@@ -21,17 +21,13 @@ pub struct GlobalArgs {
 
 impl GlobalArgs {
     /// Get the list of RPC endpoints, prioritizing RPC_URLS over RPC_URL.
-    /// Returns an error if neither is set or if the list is empty.
+    /// Returns an error if the list is empty.
     pub fn get_rpc_endpoints(&self) -> Result<Vec<String>, String> {
         let endpoints_str = self
             .rpc_urls
             .as_ref()
-            .or(self.rpc_url.as_ref())
-            .ok_or_else(|| {
-                "No RPC endpoint configured. Set either --rpc-urls or --rpc-url, or set \
-                 RPC_URLS/RPC_URL environment variables."
-                    .to_string()
-            })?;
+            .map(|s| s.as_str())
+            .unwrap_or(self.rpc_url.as_str());
 
         let endpoints: Vec<String> =
             endpoints_str.split(',').map(|s| s.trim().to_string()).collect();
