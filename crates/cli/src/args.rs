@@ -48,7 +48,7 @@ mod tests {
     fn test_get_rpc_endpoints_from_urls() {
         let args = GlobalArgs {
             rpc_urls: Some("http://localhost:8899,http://localhost:8900".to_string()),
-            rpc_url: None,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
             config: "kora.toml".to_string(),
         };
         let endpoints = args.get_rpc_endpoints().unwrap();
@@ -61,7 +61,7 @@ mod tests {
     fn test_get_rpc_endpoints_fallback_to_url() {
         let args = GlobalArgs {
             rpc_urls: None,
-            rpc_url: Some("http://localhost:8899".to_string()),
+            rpc_url: "http://localhost:8899".to_string(),
             config: "kora.toml".to_string(),
         };
         let endpoints = args.get_rpc_endpoints().unwrap();
@@ -73,7 +73,7 @@ mod tests {
     fn test_get_rpc_endpoints_urls_takes_priority() {
         let args = GlobalArgs {
             rpc_urls: Some("http://localhost:8899,http://localhost:8900".to_string()),
-            rpc_url: Some("http://localhost:9999".to_string()),
+            rpc_url: "http://localhost:9999".to_string(),
             config: "kora.toml".to_string(),
         };
         let endpoints = args.get_rpc_endpoints().unwrap();
@@ -85,7 +85,7 @@ mod tests {
     fn test_get_rpc_endpoints_trims_whitespace() {
         let args = GlobalArgs {
             rpc_urls: Some("  http://localhost:8899  ,  http://localhost:8900  ".to_string()),
-            rpc_url: None,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
             config: "kora.toml".to_string(),
         };
         let endpoints = args.get_rpc_endpoints().unwrap();
@@ -95,13 +95,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rpc_endpoints_error_when_none() {
+    fn test_get_rpc_endpoints_uses_default_when_urls_none() {
         let args = GlobalArgs {
             rpc_urls: None,
-            rpc_url: None,
+            rpc_url: "http://127.0.0.1:8899".to_string(),
             config: "kora.toml".to_string(),
         };
-        let result = args.get_rpc_endpoints();
-        assert!(result.is_err());
+        let endpoints = args.get_rpc_endpoints().unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0], "http://127.0.0.1:8899");
     }
 }
